@@ -859,6 +859,10 @@ struct llama_mmap {
     void * addr;
     size_t size;
 
+#ifdef GGML_METAL_ASYNC_MODE
+    std::vector<size_t> bytes;
+#endif
+
     llama_mmap(const llama_mmap &) = delete;
 
 #ifdef _POSIX_MAPPED_FILES
@@ -1406,6 +1410,10 @@ struct llama_model {
     e_model     type  = MODEL_UNKNOWN;
     llm_arch    arch  = LLM_ARCH_UNKNOWN;
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
+
+#ifdef GGML_METAL_ASYNC_MODE
+    std::string path = "";
+#endif
 
     std::string name = "n/a";
 
@@ -2317,6 +2325,7 @@ struct llama_model_loader {
             }
         }
 
+
         size_t done_size = 0;
         for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
@@ -2371,6 +2380,21 @@ struct llama_model_loader {
 
             done_size += ggml_nbytes(cur);
         }
+#ifdef GGML_METAL_ASYNC_MODE
+        std::string last_prefix = "abcdef";
+        for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
+            const char * name = gguf_get_tensor_name(ctx_gguf, i);
+            std::string prefix = std::string(name).substr(0, 6);
+            if (prefix != last_prefix) {
+                size_t off = file_offset(name);
+                if (std::string(name).find("blk.0.") == std::string::npos) {
+                    mapping->bytes.push_back(off);
+                }
+                last_prefix = prefix;
+            }
+        }
+        mapping->bytes[mapping->bytes.size()-1] = mapping->size;
+#endif
     }
 };
 
@@ -4352,6 +4376,21 @@ struct llm_build_context {
 
         ggml_build_forward_expand(gf, cur);
 
+#ifdef GGML_METAL_ASYNC_MODE
+        gf->segs = new int[n_layer + 1];
+        gf->segs[0] = 0;
+        gf->n_segs = 1;
+
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            //printf("[DEBUG] %d: %s\n", i, gf->nodes[i]->name);
+            if (std::string(gf->nodes[i]->name).find("l_out-") != std::string::npos) {
+                gf->segs[gf->n_segs] = i + 1;
+                gf->n_segs++;
+            }
+        }
+        gf->segs[gf->n_segs-1] = gf->n_nodes;
+        GGML_ASSERT(gf->n_segs == n_layer + 1);
+#endif
         return gf;
     }
 
@@ -5944,6 +5983,10 @@ static struct ggml_cgraph * llama_build_graph(
         }
     }
 
+#ifdef GGML_METAL_ASYNC_MODE
+    result->n_tokens = batch.n_tokens;
+#endif
+
     return result;
 }
 
@@ -6088,7 +6131,9 @@ static int llama_decode_internal(
     //       we still need some threads to process all non-mul_mat ops, but not too much to avoid interfering
     //       with the BLAS calls. need a better solution
     if (n_tokens >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas()) {
+#ifndef GGML_METAL_ASYNC_MODE
         n_threads = std::min(4, n_threads);
+#endif
     }
 
     const bool fully_offloaded = model.n_gpu_layers >= (int) hparams.n_layer + 1;
@@ -8432,8 +8477,40 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
 
-    // populate the original tensors so we get an initial meta data
+#ifdef GGML_METAL_ASYNC_MODE
+    // reorder tensors
+    std::vector<std::vector<std::pair<std::string, int>>> groups;
+    std::vector<int> orders;
+    groups.resize(model.hparams.n_layer + 2);
     for (int i = 0; i < ml.n_tensors; ++i) {
+        struct ggml_tensor * tensor = ml.get_tensor_meta(i);
+        const std::string name = ggml_get_name(tensor);
+        int gid = 0;
+        if (name.substr(0, 3) == "blk") {
+            std::string s = name.substr(4, name.length() - 4);
+            gid = std::stoi(s.substr(0, s.find('.'))) + 1;
+        } else if (name.substr(0, 6) == "output") {
+            gid = model.hparams.n_layer + 1;
+        }
+        groups[gid].push_back(std::pair<std::string, int>(name, i));
+    }
+    for (int gid = 0; gid < groups.size(); ++gid) {
+        std::sort(groups[gid].begin(), groups[gid].end());
+        for (int j = 0; j < groups[gid].size(); ++j) {
+            LLAMA_LOG_INFO("%s: %d tensor name %s %d\n", __func__, gid, groups[gid][j].first.c_str(), groups[gid][j].second);
+            orders.push_back(groups[gid][j].second);
+        }
+    }
+    assert(orders.size() == ml.n_tensors);
+#endif
+
+    // populate the original tensors so we get an initial meta data
+    for (int ind = 0; ind < ml.n_tensors; ++ind) {
+#ifdef GGML_METAL_ASYNC_MODE
+        int i = orders[ind];
+#else
+        int i = ind;
+#endif
         struct ggml_tensor * meta = ml.get_tensor_meta(i);
         gguf_add_tensor(ctx_out, meta);
     }
@@ -8448,7 +8525,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     // placeholder for the meta data
     ::zeros(fout, meta_size);
 
-    for (int i = 0; i < ml.n_tensors; ++i) {
+    for (int ind = 0; ind < ml.n_tensors; ++ind) {
+#ifdef GGML_METAL_ASYNC_MODE
+        int i = orders[ind];
+#else
+        int i = ind;
+#endif
         struct ggml_tensor * tensor = ml.get_tensor_meta(i);
 
         const std::string name = ggml_get_name(tensor);
@@ -9004,6 +9086,10 @@ struct llama_model * llama_load_model_from_file(
 
     llama_model * model = new llama_model;
 
+#ifdef GGML_METAL_ASYNC_MODE
+    model->path = std::string(path_model);
+#endif
+
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
         params.progress_callback_user_data = &cur_percentage;
@@ -9231,7 +9317,11 @@ struct llama_context * llama_new_context_with_model(
                 return NULL;                                             \
             }
 
+#ifdef GGML_METAL_ASYNC_MODE
+            LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer_per_layer(ctx->ctx_metal, "data", data_ptr, hparams.n_layer, hparams.n_embd_gqa(), ggml_type_sizef(type_k), cparams.n_ctx, ggml_tensor_overhead(), ctx->model.mapping->bytes.data(), ctx->model.mapping->bytes.size(), cparams.n_threads, ctx->model.path.c_str()));
+#else
             LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "data",  data_ptr, data_size, max_size));
+#endif
             LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "kv",    ctx->kv_self.buf.data, ctx->kv_self.buf.size, 0));
             LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "alloc", ctx->buf_alloc.data, ctx->buf_alloc.size, 0));
 #undef LLAMA_METAL_CHECK_BUF

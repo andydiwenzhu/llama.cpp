@@ -53,6 +53,28 @@ struct ggml_metal_context {
     int concur_list[GGML_MAX_CONCUR];
     int concur_list_len;
 
+#ifdef GGML_METAL_ASYNC_MODE
+    int8_t* f_bufs[GGML_METAL_MAX_COMMAND_BUFFERS];
+    int c2b[GGML_METAL_MAX_COMMAND_BUFFERS]; // cb_idx --> buf_idx
+
+    int n_cache; // n cache bufs
+    int n_bufs; // [n_cache, n_bufs) permanent bufs
+
+    const char* path; // file path for weights
+
+    size_t mem_begins[GGML_METAL_MAX_COMMAND_BUFFERS];
+    size_t mem_sizes[GGML_METAL_MAX_COMMAND_BUFFERS];
+
+    int step; // layer group step
+
+    // kv parameters
+    size_t n_layer;
+    size_t n_embd;
+    size_t wtype_size;
+    size_t n_ctx;
+    size_t overhead;
+#endif
+    
     // custom kernels
 #define GGML_METAL_DECL_KERNEL(name) \
     id<MTLFunction>             function_##name; \
@@ -209,6 +231,111 @@ static void ggml_metal_log(enum ggml_log_level level, const char * format, ...){
         va_end(args);
     }
 }
+
+#ifdef GGML_METAL_ASYNC_MODE
+bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
+                                    const char * name,
+                                    void * data,
+                                    int n_layer, 
+                                    int n_embd, 
+                                    int wtype_size, 
+                                    int n_ctx, 
+                                    int overhead,
+                                    size_t * sizes,
+                                    size_t   sizes_size,
+                                    int   n_threads,
+                                    const char* path
+                                    ) {
+    GGML_ASSERT(n_layer + 1 == sizes_size);
+                    
+    if (ctx->n_buffers >= GGML_METAL_MAX_BUFFERS) {
+        GGML_METAL_LOG_ERROR("%s: error: too many buffers\n", __func__);
+        return false;
+    }
+
+    const size_t size_page = sysconf(_SC_PAGESIZE);
+
+    ctx->path = path;
+    int fileDescriptor = open(path, O_RDONLY);
+
+    ctx->n_layer = n_layer;
+    ctx->n_embd = n_embd;
+    ctx->wtype_size = wtype_size;
+    ctx->n_ctx = n_ctx;
+    ctx->overhead = overhead;
+
+    ctx->step = (n_layer - 1) / n_threads + 1;
+    ctx->n_cb = (n_layer - 1) / ctx->step + 1;
+
+    ctx->n_bufs = ctx->device.maxBufferLength / (sizes[ctx->step] - sizes[0]);
+    ctx->n_cache = 2;
+
+    int perm_step = (ctx->n_cb - 1) / (ctx->n_bufs - ctx->n_cache - 1) + 1;
+    int perm_idx = ctx->n_cache;
+    int cache_idx = 0;
+
+    for (int cb_idx = 0; cb_idx < ctx->n_cb; ++cb_idx) {
+        const int layer_begin = cb_idx * ctx->step;
+        const int layer_end = MIN((cb_idx+1) * ctx->step, n_layer);
+
+        size_t mem_begin = sizes[layer_begin];
+        size_t mem_end = sizes[layer_end];
+        if (mem_begin % size_page) {
+            mem_begin -= mem_begin % size_page;
+        }
+        if (mem_end % size_page) {
+            mem_end += size_page - mem_end % size_page;
+        }
+        size_t size = mem_end - mem_begin;
+
+        bool is_perm = (cb_idx % perm_step == 0 || cb_idx == ctx->n_cb - 1);
+        int j = -1;
+
+        if (is_perm) {
+            // permanent layers
+            ctx->c2b[cb_idx] = perm_idx;
+            ctx->f_bufs[perm_idx] = malloc(sizeof(int8_t) * size);
+            off_t result = lseek(fileDescriptor, mem_begin, SEEK_SET);
+            GGML_ASSERT(result >= 0);
+            ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[perm_idx], size);
+            j = perm_idx;
+            perm_idx++;
+        } else {
+            ctx->c2b[cb_idx] = cache_idx % ctx->n_cache;
+            if (cache_idx < ctx->n_cache) {
+                size += 2 * size_page;
+                ctx->f_bufs[cache_idx] = malloc(sizeof(int8_t) * size);
+                j = cache_idx;
+            }
+            cache_idx++;
+        }
+
+        if (j >= 0) {
+            ctx->buffers[j].name = name;
+            ctx->buffers[j].data = data;
+            ctx->buffers[j].size = size;
+            ctx->buffers[j].metal = [ctx->device newBufferWithBytesNoCopy:(void*)ctx->f_bufs[j] length:size options:MTLResourceStorageModeShared deallocator:nil];
+            if (ctx->buffers[j].metal == nil) {
+                GGML_METAL_LOG_ERROR("%s: error: failed to allocate: cb_idx = %d, buf_idx = %d, is_perm = %d, size = %8.2lf MB\n", 
+                    __func__, cb_idx, j, is_perm, size / 1024.0 / 1024.0);
+                return false;
+            }
+            GGML_METAL_LOG_INFO("%s: allocated: cb_idx = %d, buf_idx = %d, is_perm = %d, size = %8.2lf MB\n", __func__, cb_idx, j, is_perm, size / 1024.0 / 1024.0);
+        } else {
+            GGML_ASSERT(size <= ctx->buffers[ctx->c2b[cb_idx]].size);
+            GGML_METAL_LOG_INFO("%s: assigned: cb_idx = %d, buf_idx = %d, is_perm = %d, size = %8.2lf MB\n", __func__, cb_idx, ctx->c2b[cb_idx], is_perm, size / 1024.0 / 1024.0);
+        }
+
+        ctx->mem_begins[cb_idx] = mem_begin;
+        ctx->mem_sizes[cb_idx] = size;
+    }
+
+    ctx->n_bufs = perm_idx;
+    ctx->n_buffers = ctx->n_bufs;
+    return true;
+}
+#endif
+
 
 struct ggml_metal_context * ggml_metal_init(int n_cb) {
     GGML_METAL_LOG_INFO("%s: allocating\n", __func__);
@@ -595,7 +722,7 @@ void ggml_metal_host_free(void * data) {
 }
 
 void ggml_metal_set_n_cb(struct ggml_metal_context * ctx, int n_cb) {
-    ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_BUFFERS);
+    //ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_BUFFERS);
 }
 
 int ggml_metal_if_optimized(struct ggml_metal_context * ctx) {
@@ -617,7 +744,7 @@ struct ggml_backend_metal_buffer_context {
 // the assumption is that there is 1-to-1 mapping between the host and device memory buffers, so we can find the
 // Metal buffer based on the host memory pointer
 //
-static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, struct ggml_tensor * t, size_t * offs) {
+static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, struct ggml_tensor * t, size_t * offs, int cb_idx) {
     //GGML_METAL_LOG_INFO("%s: data tensor '%16s', offs_data = %8ld, offs_eval = %8ld, offs_cach = %8ld\n", __func__, t->name, offs_data, offs_eval, offs_cach);
 
     const int64_t tsize = ggml_nbytes(t);
@@ -635,9 +762,21 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, stru
         return buf_ctx->metal;
     }
 
+#ifdef GGML_METAL_ASYNC_MODE
+    int idx = ctx->c2b[cb_idx];
+    int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[idx].data - ctx->mem_begins[cb_idx];
+    if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->mem_sizes[cb_idx]) {
+        *offs = (size_t) ioffs;
+        return ctx->buffers[idx].metal;
+    }
+    int begin = ctx->n_bufs;
+#else
+    int begin = 0;
+#endif
+
     // find the view that contains the tensor fully
-    for (int i = 0; i < ctx->n_buffers; ++i) {
-        const int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[i].data;
+    for (int i = begin; i < ctx->n_buffers; ++i) {
+        int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[i].data;
 
         //GGML_METAL_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, ctx->buffers[%d].size = %10ld, name = %s\n", ioffs, tsize, ioffs + tsize, i, ctx->buffers[i].size, ctx->buffers[i].name);
         if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->buffers[i].size) {
@@ -751,7 +890,7 @@ void ggml_metal_set_tensor(
         struct ggml_metal_context * ctx,
         struct ggml_tensor * t) {
     size_t offs;
-    id<MTLBuffer> id_dst = ggml_metal_get_buffer(ctx, t, &offs);
+    id<MTLBuffer> id_dst = ggml_metal_get_buffer(ctx, t, &offs, 0);
 
     memcpy((void *) ((uint8_t *) id_dst.contents + offs), t->data, ggml_nbytes(t));
 }
@@ -760,7 +899,7 @@ void ggml_metal_get_tensor(
         struct ggml_metal_context * ctx,
         struct ggml_tensor * t) {
     size_t offs;
-    id<MTLBuffer> id_src = ggml_metal_get_buffer(ctx, t, &offs);
+    id<MTLBuffer> id_src = ggml_metal_get_buffer(ctx, t, &offs, 0);
 
     memcpy(t->data, (void *) ((uint8_t *) id_src.contents + offs), ggml_nbytes(t));
 }
@@ -938,53 +1077,140 @@ void ggml_metal_graph_compute(
         struct ggml_metal_context * ctx,
                struct ggml_cgraph * gf) {
     @autoreleasepool {
+        // if there is ctx->concur_list, dispatch concurrently
+        // else fallback to serial dispatch
+        MTLComputePassDescriptor * edesc = MTLComputePassDescriptor.computePassDescriptor;
 
-    // if there is ctx->concur_list, dispatch concurrently
-    // else fallback to serial dispatch
-    MTLComputePassDescriptor * edesc = MTLComputePassDescriptor.computePassDescriptor;
+#ifdef GGML_METAL_ASYNC_MODE
+        const bool has_concur = false;
+#else
+        const bool has_concur = ctx->concur_list_len && ctx->concur_list_len <= GGML_MAX_CONCUR;
+#endif
 
-    const bool has_concur = ctx->concur_list_len && ctx->concur_list_len <= GGML_MAX_CONCUR;
+        const int n_nodes  = has_concur ? ctx->concur_list_len      : gf->n_nodes;
+        edesc.dispatchType = has_concur ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
 
-    const int n_nodes  = has_concur ? ctx->concur_list_len      : gf->n_nodes;
-    edesc.dispatchType = has_concur ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+        // create multiple command buffers and enqueue them
+        // then, we encode the graph into the command buffers in parallel
 
-    // create multiple command buffers and enqueue them
-    // then, we encode the graph into the command buffers in parallel
+        const int step = ctx->step;
+        const int n_cb = ctx->n_cb;
 
-    const int n_cb = ctx->n_cb;
+        for (int i = 0; i < n_cb; ++i) {
+            ctx->command_buffers[i] = [ctx->queue commandBuffer];
 
-    for (int i = 0; i < n_cb; ++i) {
-        ctx->command_buffers[i] = [ctx->queue commandBuffer];
+            // enqueue the command buffers in order to specify their execution order
+            [ctx->command_buffers[i] enqueue];
 
-        // enqueue the command buffers in order to specify their execution order
-        [ctx->command_buffers[i] enqueue];
+        #ifdef GGML_METAL_ASYNC_MODE
+            [ctx->command_buffers[i] addScheduledHandler:^(id<MTLCommandBuffer> commandBuffer) {
+                CFTimeInterval start = commandBuffer.kernelStartTime;
+                CFTimeInterval end = commandBuffer.kernelEndTime;
+                CFTimeInterval scheduleDuration = end - start;
+                //printf("[DEBUG] computing %d begins: %8.2lf\n", i, scheduleDuration);
+            }];
 
-        ctx->command_encoders[i] = [ctx->command_buffers[i] computeCommandEncoderWithDescriptor: edesc];
-    }
+            [ctx->command_buffers[i] addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+                CFTimeInterval start = commandBuffer.GPUStartTime;
+                CFTimeInterval end = commandBuffer.GPUEndTime;
+                CFTimeInterval gpuRuntimeDuration = end - start;
+                //printf("[DEBUG] computing %d ends: %8.2lfs\n", i, gpuRuntimeDuration);
+            }];
+        #endif
+             ctx->command_encoders[i] = [ctx->command_buffers[i] computeCommandEncoderWithDescriptor: edesc];
+        }
 
-    for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-        const int n_nodes_per_cb = (n_nodes + n_cb - 1) / n_cb;
+        NSURL *url = [NSURL URLWithString:@"http://localhost:8000"];
+        NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        [sessionConfiguration setHTTPAdditionalHeaders:@{@"Connection": @"keep-alive"}];
+        NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration];
+        NSMutableArray<NSURLSessionDataTask *> *dataTasks = [[NSMutableArray alloc] init];
+
+        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+            dispatch_async(ctx->d_queue, ^{
+                const int layer_begin = cb_idx*step;
+                const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer);
+                [ctx->command_buffers[cb_idx] waitUntilCompleted];
+                for (size_t i = layer_begin; i < layer_end; ++i) {
+                    size_t k = ctx->wtype_size * ctx->n_embd * ctx->n_ctx * i + ctx->overhead;
+                    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+                    [request setHTTPMethod:@"POST"];
+                    
+                    int8_t* kv = malloc(ctx->wtype_size*ctx->n_embd*gf->n_tokens*2*sizeof(int8_t));
+                    memcpy(kv, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + k, ctx->wtype_size * ctx->n_embd * gf->n_tokens);
+                    size_t v = k + ctx->wtype_size * ctx->n_embd * ctx->n_ctx * ctx->n_layer + ctx->overhead;
+                    for (size_t x = 0; x < ctx->n_embd; ++x) {
+                        size_t idx = v + x * ctx->n_ctx * ctx->wtype_size;
+                        memcpy(kv + ctx->wtype_size * ctx->n_embd * gf->n_tokens + x * gf->n_tokens * ctx->wtype_size, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + idx, gf->n_tokens * ctx->wtype_size);
+                    }
+
+                    NSData *dataToSend = [NSData dataWithBytesNoCopy:kv length:ctx->wtype_size*ctx->n_embd*gf->n_tokens*2];
+                    [request setHTTPBody:dataToSend];
+                    NSString *formattedString = [NSString stringWithFormat:@"kv%zu", i];
+                    [request setValue:formattedString forHTTPHeaderField:@"kvCache"];
+                    [request setValue:@"application/octet-stream" forHTTPHeaderField:@"Content-Type"];
+
+                    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                        if (error) {
+                            NSLog(@"Error sending data to server: %@", error);
+                        } else {
+                            // Handle the response from the server
+                            //NSLog(@"Success: %@", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+                        }
+                    }];
+                    
+                    [task resume];
+                    [dataTasks addObject:task];
+                }
+            });
+        }
+
+        //NSDate *methodStart = [NSDate date];
+        int fileDescriptor = open(ctx->path, O_RDONLY);
+
+        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+            int b_idx = ctx->c2b[cb_idx];
+
+            if (b_idx < ctx->n_cache) {
+                int last = cb_idx - 1;
+                for (; last >= 0; --last) {
+                    if (ctx->c2b[last] == b_idx) break;
+                }
+                // printf("[DEBUG] cb_idx = %d, b_idx = %d, last = %d\n", cb_idx, b_idx, last);
+                if (last >= 0) {
+                    [ctx->command_buffers[last] waitUntilCompleted];
+                }
+                size_t offset = ctx->mem_begins[cb_idx];
+                size_t size = ctx->mem_sizes[cb_idx];
+                off_t result = lseek(fileDescriptor, offset, SEEK_SET);
+                ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[b_idx], size);
+            }
+
+            //NSTimeInterval executionTime = [[NSDate date] timeIntervalSinceDate:methodStart];
+            //printf("[DEBUG] cb_idx = %d, time = %0.2lf\n", cb_idx, executionTime);
 
         dispatch_async(ctx->d_queue, ^{
+            id<MTLCommandBuffer> command_buffer = ctx->command_buffers[cb_idx];
+            id<MTLComputeCommandEncoder> encoder = ctx->command_encoders[cb_idx];
+
+            // [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
             size_t offs_src0 = 0;
             size_t offs_src1 = 0;
             size_t offs_dst  = 0;
 
-            id<MTLCommandBuffer> command_buffer  = ctx->command_buffers[cb_idx];
-            id<MTLComputeCommandEncoder> encoder = ctx->command_encoders[cb_idx];
+            const int layer_begin = cb_idx*step;
+            const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer);
 
-            const int node_start =                                      (cb_idx + 0) * n_nodes_per_cb;
-            const int node_end   = MIN((cb_idx == n_cb - 1) ? n_nodes : (cb_idx + 1) * n_nodes_per_cb, n_nodes);
+            const int node_start = gf->segs[layer_begin];
+            const int node_end = gf->segs[layer_end];
+
+            // printf("[DEBUG] cb_idx = %d, layer_begin = %d, layer_end = %d, node_start = %d, node_end = %d\n", 
+            //         cb_idx, layer_begin, layer_end, node_start, node_end);
 
             for (int ind = node_start; ind < node_end; ++ind) {
                 const int i = has_concur ? ctx->concur_list[ind] : ind;
-
-                if (i == -1) {
-                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                    continue;
-                }
-
-                //GGML_METAL_LOG_INFO("%s: encoding node %3d, op = %8s\n", __func__, i, ggml_op_name(gf->nodes[i]->op));
+                // printf("[DEBUG] cb_idx = %d, i = %d\n", cb_idx, i);
 
                 struct ggml_tensor * src0 = gf->nodes[i]->src[0];
                 struct ggml_tensor * src1 = gf->nodes[i]->src[1];
@@ -1043,23 +1269,23 @@ void ggml_metal_graph_compute(
                 const enum ggml_type src1t = src1 ? src1->type : GGML_TYPE_COUNT;
                 const enum ggml_type dstt  = dst  ? dst->type  : GGML_TYPE_COUNT;
 
-                id<MTLBuffer> id_src0 = src0 ? ggml_metal_get_buffer(ctx, src0, &offs_src0) : nil;
-                id<MTLBuffer> id_src1 = src1 ? ggml_metal_get_buffer(ctx, src1, &offs_src1) : nil;
-                id<MTLBuffer> id_dst  = dst  ? ggml_metal_get_buffer(ctx, dst,  &offs_dst)  : nil;
-
-                //GGML_METAL_LOG_INFO("%s: op - %s\n", __func__, ggml_op_name(dst->op));
-                //if (src0) {
+                id<MTLBuffer> id_src0 = src0 ? ggml_metal_get_buffer(ctx, src0, &offs_src0, cb_idx) : nil;
+                id<MTLBuffer> id_src1 = src1 ? ggml_metal_get_buffer(ctx, src1, &offs_src1, cb_idx) : nil;
+                id<MTLBuffer> id_dst  = dst  ? ggml_metal_get_buffer(ctx, dst,  &offs_dst, cb_idx)  : nil;
+        
+                // GGML_METAL_LOG_INFO("%s: op - %s\n", __func__, ggml_op_name(dst->op));
+                // if (src0) {
                 //    GGML_METAL_LOG_INFO("%s: src0 - %4s [%5lld, %5lld, %5lld], %d, %s\n", __func__, ggml_type_name(src0t), ne00, ne01, ne02,
                 //            ggml_is_contiguous(src0), src0->name);
-                //}
-                //if (src1) {
+                // }
+                // if (src1) {
                 //    GGML_METAL_LOG_INFO("%s: src1 - %4s [%5lld, %5lld, %5lld], %d, %s\n", __func__, ggml_type_name(src1t), ne10, ne11, ne12,
                 //            ggml_is_contiguous(src1), src1->name);
-                //}
-                //if (dst) {
+                // }
+                // if (dst) {
                 //    GGML_METAL_LOG_INFO("%s: dst  - %4s [%5lld, %5lld, %5lld], 1, %s\n",  __func__, ggml_type_name(dstt),  ne0,  ne1,  ne2,
                 //            dst->name);
-                //}
+                // }
 
                 switch (dst->op) {
                     case GGML_OP_CONCAT:
@@ -1757,7 +1983,7 @@ void ggml_metal_graph_compute(
                                     struct ggml_tensor * src_cur = dst->src[2 + j];
 
                                     size_t offs_src_cur = 0;
-                                    id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(ctx, src_cur, &offs_src_cur);
+                                    id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(ctx, src_cur, &offs_src_cur, cb_idx);
 
                                     [encoder setBuffer:id_src_cur offset:offs_src_cur atIndex:19 + j];
                                 }
@@ -1881,7 +2107,7 @@ void ggml_metal_graph_compute(
                                     struct ggml_tensor * src_cur = dst->src[2 + j];
 
                                     size_t offs_src_cur = 0;
-                                    id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(ctx, src_cur, &offs_src_cur);
+                                    id<MTLBuffer> id_src_cur = ggml_metal_get_buffer(ctx, src_cur, &offs_src_cur, cb_idx);
 
                                     [encoder setBuffer:id_src_cur offset:offs_src_cur atIndex:23 + j];
                                 }
@@ -2337,23 +2563,24 @@ void ggml_metal_graph_compute(
 
             [command_buffer commit];
         });
-    }
-
-    // wait for all threads to finish
-    dispatch_barrier_sync(ctx->d_queue, ^{});
-
-    // check status of command buffers
-    // needed to detect if the device ran out-of-memory for example (#1881)
-    for (int i = 0; i < n_cb; i++) {
-        [ctx->command_buffers[i] waitUntilCompleted];
-
-        MTLCommandBufferStatus status = (MTLCommandBufferStatus) [ctx->command_buffers[i] status];
-        if (status != MTLCommandBufferStatusCompleted) {
-            GGML_METAL_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, i, status);
-            GGML_ASSERT(false);
         }
-    }
 
+        // wait for all threads to finish
+        dispatch_barrier_sync(ctx->d_queue, ^{});
+
+        //[session finishTasksAndInvalidate];
+
+        // check status of command buffers
+        // needed to detect if the device ran out-of-memory for example (#1881)
+        for (int i = 0; i < n_cb; i++) {
+            [ctx->command_buffers[i] waitUntilCompleted];
+
+            MTLCommandBufferStatus status = (MTLCommandBufferStatus) [ctx->command_buffers[i] status];
+            if (status != MTLCommandBufferStatusCompleted) {
+                GGML_METAL_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, i, status);
+                GGML_ASSERT(false);
+            }
+        }
     }
 }
 

@@ -1139,6 +1139,7 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
         params.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
     }
 
+#ifndef GGML_METAL_ASYNC_MODE
     {
         LOG("warming up the model with an empty run\n");
 
@@ -1147,6 +1148,7 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
         llama_kv_cache_clear(lctx);
         llama_reset_timings(lctx);
     }
+#endif
 
     return std::make_tuple(model, lctx);
 }

@@ -26,8 +26,8 @@
 #include <stdbool.h>
 
 // max memory buffers that can be mapped to the device
-#define GGML_METAL_MAX_BUFFERS 64
-#define GGML_METAL_MAX_COMMAND_BUFFERS 32
+#define GGML_METAL_MAX_BUFFERS 128
+#define GGML_METAL_MAX_COMMAND_BUFFERS 64
 
 struct ggml_tensor;
 struct ggml_cgraph;
@@ -68,6 +68,21 @@ bool ggml_metal_add_buffer(
                              void * data,
                            size_t   size,
                            size_t   max_size);
+
+#ifdef GGML_METAL_ASYNC_MODE
+bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
+                                    const char * name,
+                                    void * data,
+                                    int n_layer, 
+                                    int n_embd, 
+                                    int wtype_size, 
+                                    int n_ctx, 
+                                    int overhead,
+                                    size_t * sizes,
+                                    size_t   sizes_size,
+                                    int   n_threads,
+                                    const char* path);
+#endif
 
 // set data from host memory into the device
 void ggml_metal_set_tensor(struct ggml_metal_context * ctx, struct ggml_tensor * t);

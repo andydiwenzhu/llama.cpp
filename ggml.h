@@ -208,6 +208,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#define GGML_METAL_ASYNC_MODE
+
 #define GGML_FILE_MAGIC   0x67676d6c // "ggml"
 #define GGML_FILE_VERSION 1
 
@@ -569,6 +571,11 @@ extern "C" {
         int n_nodes;
         int n_leafs;
 
+#ifdef GGML_METAL_ASYNC_MODE
+        int* segs;
+        int n_segs;
+        int n_tokens;
+#endif
         struct ggml_tensor ** nodes;
         struct ggml_tensor ** grads;
         struct ggml_tensor ** leafs;
