@@ -1131,17 +1131,23 @@ void ggml_metal_graph_compute(
                 const int layer_begin = cb_idx*step;
                 const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer);
                 [ctx->command_buffers[cb_idx] waitUntilCompleted];
+
+                const size_t unit_layer = ctx->wtype_size * ctx->n_embd * ctx->n_ctx + ctx->overhead;
+                const size_t k_sz = ctx->wtype_size * ctx->n_embd * gf->n_tokens;
+                const size_t v_sz_per_embd = gf->n_tokens * ctx->wtype_size;
+
                 for (size_t i = layer_begin; i < layer_end; ++i) {
-                    size_t k = ctx->wtype_size * ctx->n_embd * ctx->n_ctx * i + ctx->overhead;
+                    size_t k = unit_layer * 2 * i + ctx->overhead;
                     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
                     [request setHTTPMethod:@"POST"];
                     
-                    int8_t* kv = malloc(ctx->wtype_size*ctx->n_embd*gf->n_tokens*2*sizeof(int8_t));
-                    memcpy(kv, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + k, ctx->wtype_size * ctx->n_embd * gf->n_tokens);
-                    size_t v = k + ctx->wtype_size * ctx->n_embd * ctx->n_ctx * ctx->n_layer + ctx->overhead;
+                    int8_t* kv = malloc(k_sz * 2 * sizeof(int8_t));
+                    memcpy(kv, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + k, k_sz);
+
+                    size_t v = k + unit_layer;
                     for (size_t x = 0; x < ctx->n_embd; ++x) {
                         size_t idx = v + x * ctx->n_ctx * ctx->wtype_size;
-                        memcpy(kv + ctx->wtype_size * ctx->n_embd * gf->n_tokens + x * gf->n_tokens * ctx->wtype_size, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + idx, gf->n_tokens * ctx->wtype_size);
+                        memcpy(kv + k_sz + x * v_sz_per_embd, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + idx, v_sz_per_embd);
                     }
 
                     NSData *dataToSend = [NSData dataWithBytesNoCopy:kv length:ctx->wtype_size*ctx->n_embd*gf->n_tokens*2];
