@@ -268,11 +268,20 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
     ctx->n_cb = (n_layer - 1) / ctx->step + 1;
 
     ctx->n_bufs = ctx->device.maxBufferLength / (sizes[ctx->step] - sizes[0]);
-    ctx->n_cache = 2;
 
-    int perm_step = (ctx->n_cb - 1) / (ctx->n_bufs - ctx->n_cache - 1) + 1;
-    int perm_idx = ctx->n_cache;
+    int perm_step = 1;
+    int perm_idx = 0;
     int cache_idx = 0;
+
+    if (ctx->n_bufs >= ctx->n_cb) {
+        ctx->n_bufs = ctx->n_cb;
+        ctx->n_cache = 0;
+    } else {
+        ctx->n_cache = 2;
+        perm_step = (ctx->n_cb - 1) / (ctx->n_bufs - ctx->n_cache - 1) + 1;
+        perm_idx = ctx->n_cache;
+        cache_idx = 0;
+    }
 
     for (int cb_idx = 0; cb_idx < ctx->n_cb; ++cb_idx) {
         const int layer_begin = cb_idx * ctx->step;
@@ -764,7 +773,7 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, stru
 
 #ifdef GGML_METAL_ASYNC_MODE
     int idx = ctx->c2b[cb_idx];
-    int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[idx].data - ctx->mem_begins[cb_idx];
+    int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[idx].data - (int64_t) ctx->mem_begins[cb_idx];
     if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->mem_sizes[cb_idx]) {
         *offs = (size_t) ioffs;
         return ctx->buffers[idx].metal;
@@ -1158,7 +1167,7 @@ void ggml_metal_graph_compute(
 
                     NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
                         if (error) {
-                            NSLog(@"Error sending data to server: %@", error);
+                            //NSLog(@"Error sending data to server: %@", error);
                         } else {
                             // Handle the response from the server
                             //NSLog(@"Success: %@", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
