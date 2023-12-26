@@ -8,7 +8,7 @@ kvCache = None
 def write_kv_to_file(idx, content):
     overhead = 416
     embd = 1024
-    layer = 32
+    layer = 80#32
     ctx = 512
     wtype = 2
     tokens = 4
@@ -58,7 +58,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         
         # Print the POST request's body to the console/screen
         print(f"Received: {len(post_data)} bytes, content_length = {content_length}, kv_cache = {self.headers.get('kvCache', 'N/A')}")
-        # write_kv_to_file(int(self.headers['kvCache'][2:]), post_data)
+        write_kv_to_file(int(self.headers['kvCache'][2:]), post_data)
 
         # Send response status code
         self.send_response(200)

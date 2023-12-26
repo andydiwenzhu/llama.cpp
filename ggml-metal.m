@@ -277,7 +277,7 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
         ctx->n_bufs = ctx->n_cb;
         ctx->n_cache = 0;
     } else {
-        ctx->n_cache = 2;
+        ctx->n_cache = 2; // ctx->n_bufs - 2;
         perm_step = (ctx->n_cb - 1) / (ctx->n_bufs - ctx->n_cache - 1) + 1;
         perm_idx = ctx->n_cache;
         cache_idx = 0;
@@ -1191,7 +1191,7 @@ void ggml_metal_graph_compute(
                 for (; last >= 0; --last) {
                     if (ctx->c2b[last] == b_idx) break;
                 }
-                // printf("[DEBUG] cb_idx = %d, b_idx = %d, last = %d\n", cb_idx, b_idx, last);
+                //printf("[DEBUG] cb_idx = %d, b_idx = %d, last = %d\n", cb_idx, b_idx, last);
                 if (last >= 0) {
                     [ctx->command_buffers[last] waitUntilCompleted];
                 }
