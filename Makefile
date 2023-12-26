@@ -1,6 +1,6 @@
 # Define the default target now so that it is always the first target
 BUILD_TARGETS = \
-	main quantize quantize-stats perplexity embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
+	uli_test main quantize quantize-stats perplexity embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
 	simple batched batched-bench save-load-state server gguf llama-bench libllava.a llava-cli baby-llama beam-search  \
 	speculative infill tokenize benchmark-matmult parallel finetune export-lora lookahead tests/test-c.o
 
@@ -554,6 +554,9 @@ train.o: common/train.cpp common/train.h
 libllama.so: llama.o ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
 
+api.o: uli/src/api.cc
+	$(CXX) $(CXXFLAGS) -c $< -o $@ -Iuli/include
+
 clean:
 	rm -vrf *.o tests/*.o *.so *.dll benchmark-matmult common/build-info.cpp *.dot $(COV_TARGETS) $(BUILD_TARGETS) $(TEST_TARGETS)
 
@@ -561,7 +564,13 @@ clean:
 # Examples
 #
 
-main: examples/main/main.cpp                                  ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS)
+uli_test: uli/examples/uli_test.c							  ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS) api.o
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -Iuli/include -o $@ $(LDFLAGS)
+	@echo
+	@echo '====  Run ./uli  ===='
+	@echo
+
+main: examples/main/main.cpp                                  ggml.o llama.o $(COMMON_DEPS) console.o grammar-parser.o $(OBJS) api.o
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 	@echo
 	@echo '====  Run ./main -h for help.  ===='

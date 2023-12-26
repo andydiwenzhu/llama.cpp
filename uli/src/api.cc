@@ -19,11 +19,12 @@ ULI_MODEL uli_init_model(const char* model_path) {
 ULI_MODEL_PARAMS uli_get_model_params(ULI_MODEL model) {
     auto _model = static_cast<llama_model*>(model);
     ULI_MODEL_PARAMS params;
-    params.n_ctx_train = _model->hparams.n_ctx_train;
-    params.n_embd = _model->hparams.n_embd;
-    params.n_gqa = _model->hparams.n_gqa();
-    params.n_layer = _model->hparams.n_layer;
+    params.n_ctx_train = 1;
+    params.n_embd = 2;
+    params.n_gqa = 3;
+    params.n_layer = 4;
     params.w_sz = 1;
+    return params;
 }
 
 
@@ -44,6 +45,7 @@ ULI_CTX uli_init_context(ULI_MODEL model) {
 
     cparams.n_threads = 64;
     llama_context * lctx = llama_new_context_with_model(_model, cparams);
+    return lctx;
 }
 
 ULI_KV uli_get_kv(ULI_CTX ctx, size_t idx_layer) {
@@ -67,5 +69,5 @@ ULI_TOKEN uli_decode(ULI_CTX ctx, ULI_TOKEN token) {
 }
 
 void uli_clear(ULI_CTX ctx) {
-    
+
 }

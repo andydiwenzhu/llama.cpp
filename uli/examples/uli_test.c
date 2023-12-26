@@ -1,3 +1,6 @@
+#include <assert.h>
+#include <stdio.h>
+
 #include "predefine.h"
 #include "api.h"
 
