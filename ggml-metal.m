@@ -1180,13 +1180,14 @@ void ggml_metal_graph_compute(
             });
         }
 
-        //NSDate *methodStart = [NSDate date];
+        NSDate *methodStart = [NSDate date];
         int fileDescriptor = open(ctx->path, O_RDONLY);
 
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             int b_idx = ctx->c2b[cb_idx];
 
             if (b_idx < ctx->n_cache) {
+                NSTimeInterval executionTime1 = [[NSDate date] timeIntervalSinceDate:methodStart];
                 int last = cb_idx - 1;
                 for (; last >= 0; --last) {
                     if (ctx->c2b[last] == b_idx) break;
@@ -1195,14 +1196,20 @@ void ggml_metal_graph_compute(
                 if (last >= 0) {
                     [ctx->command_buffers[last] waitUntilCompleted];
                 }
+                
+                NSTimeInterval executionTime2 = [[NSDate date] timeIntervalSinceDate:methodStart];
                 size_t offset = ctx->mem_begins[cb_idx];
                 size_t size = ctx->mem_sizes[cb_idx];
                 off_t result = lseek(fileDescriptor, offset, SEEK_SET);
-                ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[b_idx], size);
+                static const size_t bs = 4096 * 1024;
+                for (int i = 0; i < size; i += bs) {
+                    ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[b_idx] + i, size - i < bs ? size - i : bs);
+                }
+                
+                NSTimeInterval executionTime3 = [[NSDate date] timeIntervalSinceDate:methodStart];
+                printf("[DEBUG] cb_idx = %d, wait_time = %0.2lf, read_time = %0.2lf\n", cb_idx, executionTime2 - executionTime1, executionTime3 - executionTime2);
             }
 
-            //NSTimeInterval executionTime = [[NSDate date] timeIntervalSinceDate:methodStart];
-            //printf("[DEBUG] cb_idx = %d, time = %0.2lf\n", cb_idx, executionTime);
 
         dispatch_async(ctx->d_queue, ^{
             id<MTLCommandBuffer> command_buffer = ctx->command_buffers[cb_idx];

@@ -1,34 +1,22 @@
-// Unified Llama Interface
+#include "llama.h"
+#include <vector>
 
-#include <stddef.h>
-#include <stdint.h>
-
+// params
+typedef gpt_params ULI_PARAMS;
 
 // token
-typedef void* ULI_TOKEN;
-typedef struct ULI_TOKENS {
-    ULI_TOKEN* tokens;
-    size_t size;
-} ULI_TOKENS;
-
+typedef llama_token ULI_TOKEN;
+typedef std::vector<llama_token> ULI_TOKENS;
 
 // model
-typedef void* ULI_MODEL;
-
-typedef struct ULI_MODEL_PARAMS {
-    size_t n_layer;
-    size_t n_embd;
-    size_t n_gqa;
-    size_t w_sz;
-    size_t n_ctx_train;
-} ULI_MODEL_PARAMS;
-
+typedef llama_model* ULI_MODEL;
 
 // kv cache
 typedef void* ULI_KV;
 
-
 // context
-typedef void* ULI_CTX;
-
+typedef struct ULI_CTX {
+    llama_context* lctx;
+    llama_sampling_context* sctx;
+} ULI_CTX;
 
