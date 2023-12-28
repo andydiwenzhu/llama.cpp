@@ -6,7 +6,7 @@ import pandas as pd
 
 
 def run(bs=4, numjobs=1):
-    command = f"fio --randrepeat=1 --ioengine=posixaio --direct=1 --gtod_reduce=1 --name=test --filename=test --bs={bs}k --iodepth=64 --size=4G --readwrite=randread --numjobs={numjobs}"
+    command = f"fio --randrepeat=1 --ioengine=posixaio --direct=1 --gtod_reduce=1 --name=test --filename=test --bs={bs}k --iodepth=64 --size=4G --readwrite=read --numjobs={numjobs}"
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
     r = str(stdout)
@@ -16,7 +16,8 @@ def run(bs=4, numjobs=1):
 
 
 if __name__ == '__main__':
-    for bs in range(10):
-        for numjobs in range(1):
-            run(1024 * (2**bs), 2**numjobs)
-        print("")
+    run()
+    # for bs in range(10):
+    #     for numjobs in range(1):
+    #         run(1024 * (2**bs), 2**numjobs)
+    #     print("")

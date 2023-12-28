@@ -267,21 +267,10 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
     ctx->step = (n_layer - 1) / n_threads + 1;
     ctx->n_cb = (n_layer - 1) / ctx->step + 1;
 
-    ctx->n_bufs = ctx->device.maxBufferLength / (sizes[ctx->step] - sizes[0]);
+    ctx->n_bufs = ctx->device.maxBufferLength / (sizes[ctx->step] - sizes[0]) + 1;
+    ctx->n_cache = 2;
 
-    int perm_step = 1;
-    int perm_idx = 0;
-    int cache_idx = 0;
-
-    if (ctx->n_bufs >= ctx->n_cb) {
-        ctx->n_bufs = ctx->n_cb;
-        ctx->n_cache = 0;
-    } else {
-        ctx->n_cache = 2; // ctx->n_bufs - 2;
-        perm_step = (ctx->n_cb - 1) / (ctx->n_bufs - ctx->n_cache - 1) + 1;
-        perm_idx = ctx->n_cache;
-        cache_idx = 0;
-    }
+    size_t max_sizes[10];
 
     for (int cb_idx = 0; cb_idx < ctx->n_cb; ++cb_idx) {
         const int layer_begin = cb_idx * ctx->step;
@@ -297,49 +286,46 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
         }
         size_t size = mem_end - mem_begin;
 
-        bool is_perm = (cb_idx % perm_step == 0 || cb_idx == ctx->n_cb - 1);
-        int j = -1;
-
-        if (is_perm) {
-            // permanent layers
-            ctx->c2b[cb_idx] = perm_idx;
-            ctx->f_bufs[perm_idx] = malloc(sizeof(int8_t) * size);
-            off_t result = lseek(fileDescriptor, mem_begin, SEEK_SET);
-            GGML_ASSERT(result >= 0);
-            ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[perm_idx], size);
-            j = perm_idx;
-            perm_idx++;
-        } else {
-            ctx->c2b[cb_idx] = cache_idx % ctx->n_cache;
-            if (cache_idx < ctx->n_cache) {
-                size += 2 * size_page;
-                ctx->f_bufs[cache_idx] = malloc(sizeof(int8_t) * size);
-                j = cache_idx;
-            }
-            cache_idx++;
-        }
-
-        if (j >= 0) {
-            ctx->buffers[j].name = name;
-            ctx->buffers[j].data = data;
-            ctx->buffers[j].size = size;
-            ctx->buffers[j].metal = [ctx->device newBufferWithBytesNoCopy:(void*)ctx->f_bufs[j] length:size options:MTLResourceStorageModeShared deallocator:nil];
-            if (ctx->buffers[j].metal == nil) {
-                GGML_METAL_LOG_ERROR("%s: error: failed to allocate: cb_idx = %d, buf_idx = %d, is_perm = %d, size = %8.2lf MB\n", 
-                    __func__, cb_idx, j, is_perm, size / 1024.0 / 1024.0);
-                return false;
-            }
-            GGML_METAL_LOG_INFO("%s: allocated: cb_idx = %d, buf_idx = %d, is_perm = %d, size = %8.2lf MB\n", __func__, cb_idx, j, is_perm, size / 1024.0 / 1024.0);
-        } else {
-            GGML_ASSERT(size <= ctx->buffers[ctx->c2b[cb_idx]].size);
-            GGML_METAL_LOG_INFO("%s: assigned: cb_idx = %d, buf_idx = %d, is_perm = %d, size = %8.2lf MB\n", __func__, cb_idx, ctx->c2b[cb_idx], is_perm, size / 1024.0 / 1024.0);
-        }
+        int b_idx = cb_idx < ctx->n_bufs ? cb_idx : (cb_idx - ctx->n_bufs) % ctx->n_cache;
+        max_sizes[b_idx] = b_idx == cb_idx ? size : MAX(max_sizes[b_idx], size);
 
         ctx->mem_begins[cb_idx] = mem_begin;
         ctx->mem_sizes[cb_idx] = size;
     }
 
-    ctx->n_bufs = perm_idx;
+    NSDate *methodStart = [NSDate date];
+
+    for (int b_idx = 0; b_idx < ctx->n_bufs; ++b_idx) {
+        GGML_ASSERT(ctx->mem_sizes[b_idx] <= max_sizes[b_idx]);
+        ctx->f_bufs[b_idx] = malloc(sizeof(int8_t) * max_sizes[b_idx]);
+    
+        ctx->buffers[b_idx].name = name;
+        ctx->buffers[b_idx].data = data;
+        ctx->buffers[b_idx].size = max_sizes[b_idx];
+        ctx->buffers[b_idx].metal = [ctx->device newBufferWithBytesNoCopy:(void*)ctx->f_bufs[b_idx] length:max_sizes[b_idx] options:MTLResourceStorageModeShared deallocator:nil];
+        //ctx->buffers[b_idx].metal = [ctx->device newBufferWithLength:max_sizes[b_idx] options:MTLResourceStorageModeShared];
+        if (ctx->buffers[b_idx].metal == nil) {
+            GGML_METAL_LOG_ERROR("%s: error: failed to allocate: buf_idx = %d, size = %8.2lf MB\n", 
+                __func__, b_idx, max_sizes[b_idx] / 1024.0 / 1024.0);
+            return false;
+        }
+        GGML_METAL_LOG_INFO("%s: allocated: buf_idx = %d, size = %8.2lf MB\n", __func__, b_idx, max_sizes[b_idx] / 1024.0 / 1024.0);
+
+        NSTimeInterval read_begin = [[NSDate date] timeIntervalSinceDate:methodStart];
+        off_t result = lseek(fileDescriptor, ctx->mem_begins[b_idx], SEEK_SET);
+        GGML_ASSERT(result >= 0);
+        ssize_t bytesRead = read(fileDescriptor, ctx->buffers[b_idx].metal.contents, ctx->mem_sizes[b_idx]);
+        NSTimeInterval read_end = [[NSDate date] timeIntervalSinceDate:methodStart];
+    }
+
+    // id<MTLCommandQueue> commandQueue = [ctx->device newCommandQueue];
+    // id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    // id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    // [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    // [encoder endEncoding];
+    // [commandBuffer commit];
+    // [commandBuffer waitUntilCompleted];
+
     ctx->n_buffers = ctx->n_bufs;
     return true;
 }
@@ -772,7 +758,7 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, stru
     }
 
 #ifdef GGML_METAL_ASYNC_MODE
-    int idx = ctx->c2b[cb_idx];
+    int idx = cb_idx < ctx->n_bufs ? cb_idx : (cb_idx - ctx->n_bufs) % ctx->n_cache; //ctx->c2b[cb_idx];
     int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[idx].data - (int64_t) ctx->mem_begins[cb_idx];
     if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->mem_sizes[cb_idx]) {
         *offs = (size_t) ioffs;
@@ -1103,7 +1089,9 @@ void ggml_metal_graph_compute(
         // then, we encode the graph into the command buffers in parallel
 
         const int step = ctx->step;
-        const int n_cb = ctx->n_cb;
+        const int n_cb = ctx->n_bufs; //ctx->n_cb;
+
+        NSDate *methodStart = [NSDate date];
 
         for (int i = 0; i < n_cb; ++i) {
             ctx->command_buffers[i] = [ctx->queue commandBuffer];
@@ -1111,107 +1099,122 @@ void ggml_metal_graph_compute(
             // enqueue the command buffers in order to specify their execution order
             [ctx->command_buffers[i] enqueue];
 
-        #ifdef GGML_METAL_ASYNC_MODE
-            [ctx->command_buffers[i] addScheduledHandler:^(id<MTLCommandBuffer> commandBuffer) {
-                CFTimeInterval start = commandBuffer.kernelStartTime;
-                CFTimeInterval end = commandBuffer.kernelEndTime;
-                CFTimeInterval scheduleDuration = end - start;
-                //printf("[DEBUG] computing %d begins: %8.2lf\n", i, scheduleDuration);
-            }];
+        // #ifdef GGML_METAL_ASYNC_MODE
+        //     [ctx->command_buffers[i] addScheduledHandler:^(id<MTLCommandBuffer> commandBuffer) {
+        //         CFTimeInterval start = commandBuffer.kernelStartTime;
+        //         CFTimeInterval end = commandBuffer.kernelEndTime;
+        //         CFTimeInterval scheduleDuration = end - start;
+        //         if (scheduleDuration > 0.01) {
+        //             printf("[DEBUG] computing %d begins: %8.2lf\n", i, scheduleDuration);
+        //         }
+        //     }];
 
-            [ctx->command_buffers[i] addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
-                CFTimeInterval start = commandBuffer.GPUStartTime;
-                CFTimeInterval end = commandBuffer.GPUEndTime;
-                CFTimeInterval gpuRuntimeDuration = end - start;
-                //printf("[DEBUG] computing %d ends: %8.2lfs\n", i, gpuRuntimeDuration);
-            }];
-        #endif
+        //     [ctx->command_buffers[i] addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+        //         CFTimeInterval start = commandBuffer.GPUStartTime;
+        //         CFTimeInterval end = commandBuffer.GPUEndTime;
+        //         CFTimeInterval gpuRuntimeDuration = end - start;
+        //         if (gpuRuntimeDuration > 0.1) {
+        //             printf("[DEBUG] computing %d ends: %8.2lfs\n", i, gpuRuntimeDuration);
+        //         }
+        //     }];
+        // #endif
              ctx->command_encoders[i] = [ctx->command_buffers[i] computeCommandEncoderWithDescriptor: edesc];
         }
 
-        NSURL *url = [NSURL URLWithString:@"http://localhost:8000"];
-        NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration defaultSessionConfiguration];
-        [sessionConfiguration setHTTPAdditionalHeaders:@{@"Connection": @"keep-alive"}];
-        NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration];
-        NSMutableArray<NSURLSessionDataTask *> *dataTasks = [[NSMutableArray alloc] init];
+        // NSURL *url = [NSURL URLWithString:@"http://localhost:8000"];
+        // NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        // [sessionConfiguration setHTTPAdditionalHeaders:@{@"Connection": @"keep-alive"}];
+        // NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration];
+        // NSMutableArray<NSURLSessionDataTask *> *dataTasks = [[NSMutableArray alloc] init];
 
-        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-            dispatch_async(ctx->d_queue, ^{
-                const int layer_begin = cb_idx*step;
-                const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer);
-                [ctx->command_buffers[cb_idx] waitUntilCompleted];
+        // for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+        //     dispatch_async(ctx->d_queue, ^{
+        //         const int layer_begin = cb_idx*step;
+        //         const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer);
+        //         [ctx->command_buffers[cb_idx] waitUntilCompleted];
 
-                const size_t unit_layer = ctx->wtype_size * ctx->n_embd * ctx->n_ctx + ctx->overhead;
-                const size_t k_sz = ctx->wtype_size * ctx->n_embd * gf->n_tokens;
-                const size_t v_sz_per_embd = gf->n_tokens * ctx->wtype_size;
+        //         const size_t unit_layer = ctx->wtype_size * ctx->n_embd * ctx->n_ctx + ctx->overhead;
+        //         const size_t k_sz = ctx->wtype_size * ctx->n_embd * gf->n_tokens;
+        //         const size_t v_sz_per_embd = gf->n_tokens * ctx->wtype_size;
 
-                for (size_t i = layer_begin; i < layer_end; ++i) {
-                    size_t k = unit_layer * 2 * i + ctx->overhead;
-                    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-                    [request setHTTPMethod:@"POST"];
+        //         for (size_t i = layer_begin; i < layer_end; ++i) {
+        //             size_t k = unit_layer * 2 * i + ctx->overhead;
+        //             NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+        //             [request setHTTPMethod:@"POST"];
                     
-                    int8_t* kv = malloc(k_sz * 2 * sizeof(int8_t));
-                    memcpy(kv, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + k, k_sz);
+        //             int8_t* kv = malloc(k_sz * 2 * sizeof(int8_t));
+        //             memcpy(kv, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + k, k_sz);
 
-                    size_t v = k + unit_layer;
-                    for (size_t x = 0; x < ctx->n_embd; ++x) {
-                        size_t idx = v + x * ctx->n_ctx * ctx->wtype_size;
-                        memcpy(kv + k_sz + x * v_sz_per_embd, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + idx, v_sz_per_embd);
-                    }
+        //             size_t v = k + unit_layer;
+        //             for (size_t x = 0; x < ctx->n_embd; ++x) {
+        //                 size_t idx = v + x * ctx->n_ctx * ctx->wtype_size;
+        //                 memcpy(kv + k_sz + x * v_sz_per_embd, (int8_t*)ctx->buffers[ctx->n_bufs].metal.contents + idx, v_sz_per_embd);
+        //             }
 
-                    NSData *dataToSend = [NSData dataWithBytesNoCopy:kv length:ctx->wtype_size*ctx->n_embd*gf->n_tokens*2];
-                    [request setHTTPBody:dataToSend];
-                    NSString *formattedString = [NSString stringWithFormat:@"kv%zu", i];
-                    [request setValue:formattedString forHTTPHeaderField:@"kvCache"];
-                    [request setValue:@"application/octet-stream" forHTTPHeaderField:@"Content-Type"];
+        //             NSData *dataToSend = [NSData dataWithBytesNoCopy:kv length:ctx->wtype_size*ctx->n_embd*gf->n_tokens*2];
+        //             [request setHTTPBody:dataToSend];
+        //             NSString *formattedString = [NSString stringWithFormat:@"kv%zu", i];
+        //             [request setValue:formattedString forHTTPHeaderField:@"kvCache"];
+        //             [request setValue:@"application/octet-stream" forHTTPHeaderField:@"Content-Type"];
 
-                    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                        if (error) {
-                            //NSLog(@"Error sending data to server: %@", error);
-                        } else {
-                            // Handle the response from the server
-                            //NSLog(@"Success: %@", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
-                        }
-                    }];
+        //             NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        //                 if (error) {
+        //                     //NSLog(@"Error sending data to server: %@", error);
+        //                 } else {
+        //                     // Handle the response from the server
+        //                     //NSLog(@"Success: %@", [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+        //                 }
+        //             }];
                     
-                    [task resume];
-                    [dataTasks addObject:task];
-                }
-            });
-        }
+        //             [task resume];
+        //             [dataTasks addObject:task];
+        //         }
+        //     });
+        // }
 
-        NSDate *methodStart = [NSDate date];
         int fileDescriptor = open(ctx->path, O_RDONLY);
 
-        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-            int b_idx = ctx->c2b[cb_idx];
+        NSTimeInterval read_ends[65];
+        read_ends[0] = [[NSDate date] timeIntervalSinceDate:methodStart];
+        //  NSTimeInterval copy_ends[65];
+        //  copy_ends[0] = [[NSDate date] timeIntervalSinceDate:methodStart];
 
-            if (b_idx < ctx->n_cache) {
-                NSTimeInterval executionTime1 = [[NSDate date] timeIntervalSinceDate:methodStart];
-                int last = cb_idx - 1;
-                for (; last >= 0; --last) {
-                    if (ctx->c2b[last] == b_idx) break;
-                }
-                //printf("[DEBUG] cb_idx = %d, b_idx = %d, last = %d\n", cb_idx, b_idx, last);
-                if (last >= 0) {
-                    [ctx->command_buffers[last] waitUntilCompleted];
-                }
+        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+            int b_idx = (cb_idx - ctx->n_bufs) % ctx->n_cache;
+
+            if (cb_idx >= ctx->n_bufs) {
+                int last = cb_idx - ctx->n_bufs < ctx->n_cache ? cb_idx - ctx->n_bufs : cb_idx - ctx->n_cache;
+                [ctx->command_buffers[last] waitUntilCompleted];
                 
-                NSTimeInterval executionTime2 = [[NSDate date] timeIntervalSinceDate:methodStart];
+                NSTimeInterval read_begin = [[NSDate date] timeIntervalSinceDate:methodStart];
                 size_t offset = ctx->mem_begins[cb_idx];
                 size_t size = ctx->mem_sizes[cb_idx];
                 off_t result = lseek(fileDescriptor, offset, SEEK_SET);
-                static const size_t bs = 4096 * 1024;
+                const size_t bs = 4096 * 1024;
                 for (int i = 0; i < size; i += bs) {
                     ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[b_idx] + i, size - i < bs ? size - i : bs);
                 }
                 
-                NSTimeInterval executionTime3 = [[NSDate date] timeIntervalSinceDate:methodStart];
-                printf("[DEBUG] cb_idx = %d, wait_time = %0.2lf, read_time = %0.2lf\n", cb_idx, executionTime2 - executionTime1, executionTime3 - executionTime2);
+                NSTimeInterval read_end = [[NSDate date] timeIntervalSinceDate:methodStart];
+                read_ends[cb_idx+1] = read_end;
+                //printf("[DEBUG] cb_idx = %d, b_idx = %d, last = %d, wait_time = %0.2lf, read_time = %0.2lf\n", cb_idx, b_idx, last, read_begin - read_ends[cb_idx], read_end - read_begin);
+            } else {
+                read_ends[cb_idx+1] = read_ends[cb_idx];
             }
 
-
         dispatch_async(ctx->d_queue, ^{
+            // if (cb_idx >= ctx->n_bufs) {
+            //     if (cb_idx >= ctx->n_bufs) {
+            //         [ctx->command_buffers[cb_idx - 1] waitUntilCompleted];
+            //     } else {
+            //         [ctx->command_buffers[cb_idx - ctx->n_bufs] waitUntilCompleted];
+            //     }
+            //     NSTimeInterval copy_begin = [[NSDate date] timeIntervalSinceDate:methodStart];
+            //     memcpy(ctx->buffers[b_idx].metal.contents, ctx->f_bufs[c_idx], ctx->mem_sizes[cb_idx]);
+            //     NSTimeInterval copy_end = [[NSDate date] timeIntervalSinceDate:methodStart];
+            //     printf("[DEBUG] cb_idx = %d, b_idx = %d, c_idx = %d, copy_time = %0.2lf\n", cb_idx, b_idx, c_idx, copy_end - copy_begin);
+            // }
+
             id<MTLCommandBuffer> command_buffer = ctx->command_buffers[cb_idx];
             id<MTLComputeCommandEncoder> encoder = ctx->command_encoders[cb_idx];
 
