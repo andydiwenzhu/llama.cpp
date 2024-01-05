@@ -2387,13 +2387,14 @@ struct llama_model_loader {
             std::string prefix = std::string(name).substr(0, 6);
             if (prefix != last_prefix) {
                 size_t off = file_offset(name);
-                if (std::string(name).find("blk.0.") == std::string::npos) {
+                //if (std::string(name).find("blk.0.") == std::string::npos) {
                     mapping->bytes.push_back(off);
-                }
+                //}
                 last_prefix = prefix;
             }
         }
-        mapping->bytes[mapping->bytes.size()-1] = mapping->size;
+        mapping->bytes.push_back(mapping->size);
+        //mapping->bytes[mapping->bytes.size()-1] = mapping->size;
 #endif
     }
 };
@@ -4377,19 +4378,17 @@ struct llm_build_context {
         ggml_build_forward_expand(gf, cur);
 
 #ifdef GGML_METAL_ASYNC_MODE
-        gf->segs = new int[n_layer + 1];
+        gf->segs = new int[n_layer + 3];
         gf->segs[0] = 0;
         gf->n_segs = 1;
 
         for (int i = 0; i < gf->n_nodes; ++i) {
-            //printf("[DEBUG] %d: %s\n", i, gf->nodes[i]->name);
-            if (std::string(gf->nodes[i]->name).find("l_out-") != std::string::npos) {
-                gf->segs[gf->n_segs] = i + 1;
-                gf->n_segs++;
+            if (std::string(gf->nodes[i]->name).find("inp_embd") != std::string::npos || std::string(gf->nodes[i]->name).find("l_out-") != std::string::npos) {
+                gf->segs[gf->n_segs++] = i + 1;
             }
         }
-        gf->segs[gf->n_segs-1] = gf->n_nodes;
-        GGML_ASSERT(gf->n_segs == n_layer + 1);
+        gf->segs[gf->n_segs++] = gf->n_nodes;
+        GGML_ASSERT(gf->n_segs == n_layer + 3);
 #endif
         return gf;
     }
@@ -9245,6 +9244,8 @@ struct llama_context * llama_new_context_with_model(
 #endif
             // measure memory requirements for the graph
             size_t alloc_size = ggml_allocr_alloc_graph(ctx->alloc, gf) + tensor_alignment;
+
+            alloc_size *= 2;
 
             LLAMA_LOG_INFO("%s: compute buffer total size = %.2f MiB\n", __func__, (ctx->buf_compute.size + alloc_size) / 1024.0 / 1024.0);
 

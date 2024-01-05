@@ -106,6 +106,57 @@ static void llama_log_callback_logTee(ggml_log_level level, const char * text, v
     LOG_TEE("%s", text);
 }
 
+
+// int main(int argc, char ** argv) {
+//     gpt_params params;
+//     g_params = &params;
+//     if (!gpt_params_parse(argc, argv, params)) {
+//         return 1;
+//     }
+//     llama_sampling_params & sparams = params.sparams;
+
+//     llama_model * model;
+//     llama_context * ctx;
+//     g_model = &model;
+//     g_ctx = &ctx;
+//     std::tie(model, ctx) = llama_init_from_gpt_params(params);
+
+//     const bool add_bos = llama_should_add_bos_token(model);
+//     std::vector<llama_token> embd_inp;
+//     embd_inp = ::llama_tokenize(ctx, params.prompt, add_bos, true);
+
+//     struct llama_sampling_context * ctx_sampling = llama_sampling_init(sparams);
+
+
+//     for (int i = 0; i < (int) embd_inp.size(); i += params.n_batch) {
+//         int n_eval = (int) embd_inp.size() - i;
+//         if (n_eval > params.n_batch) {
+//             n_eval = params.n_batch;
+//         }
+
+//         llama_batch seg = llama_batch_get_one(&embd_inp[i], n_eval, i, 0);
+
+//         if (llama_decode(ctx, seg)) {
+//             LOG_TEE("%s : failed to eval\n", __func__);
+//             return 1;
+//         }
+//     }
+    
+//     const llama_token id = llama_sampling_sample(ctx_sampling, ctx, NULL);
+
+//     llama_sampling_accept(ctx_sampling, ctx, id, true);
+
+//     printf("[DEBUG] last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());
+//     llama_print_timings(ctx);
+
+//     llama_free(ctx);
+//     llama_free_model(model);
+//     llama_sampling_free(ctx_sampling);
+
+//     return 0;
+// }
+
+
 int main(int argc, char ** argv) {
     gpt_params params;
     g_params = &params;

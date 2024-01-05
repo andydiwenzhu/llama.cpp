@@ -73,6 +73,9 @@ struct ggml_metal_context {
     size_t wtype_size;
     size_t n_ctx;
     size_t overhead;
+
+    // stats
+    float gpu_time;
 #endif
     
     // custom kernels
@@ -246,7 +249,7 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
                                     int   n_threads,
                                     const char* path
                                     ) {
-    GGML_ASSERT(n_layer + 1 == sizes_size);
+    GGML_ASSERT(n_layer + 3 == sizes_size);
                     
     if (ctx->n_buffers >= GGML_METAL_MAX_BUFFERS) {
         GGML_METAL_LOG_ERROR("%s: error: too many buffers\n", __func__);
@@ -264,17 +267,17 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
     ctx->n_ctx = n_ctx;
     ctx->overhead = overhead;
 
-    ctx->step = (n_layer - 1) / n_threads + 1;
-    ctx->n_cb = (n_layer - 1) / ctx->step + 1;
+    ctx->step = 1; // (n_layer + 1) / n_threads + 1;
+    ctx->n_cb = (n_layer + 1) / ctx->step + 1;
 
-    ctx->n_bufs = ctx->device.maxBufferLength / (sizes[ctx->step] - sizes[0]) + 1;
+    ctx->n_bufs = n_threads; //ctx->device.recommendedMaxWorkingSetSize / (sizes[ctx->step + 1] - sizes[1]) - 6;
     ctx->n_cache = 2;
 
-    size_t max_sizes[10];
+    size_t max_sizes[GGML_METAL_MAX_BUFFERS] = {0};
 
     for (int cb_idx = 0; cb_idx < ctx->n_cb; ++cb_idx) {
         const int layer_begin = cb_idx * ctx->step;
-        const int layer_end = MIN((cb_idx+1) * ctx->step, n_layer);
+        const int layer_end = MIN((cb_idx+1) * ctx->step, n_layer + 2);
 
         size_t mem_begin = sizes[layer_begin];
         size_t mem_end = sizes[layer_end];
@@ -286,9 +289,10 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
         }
         size_t size = mem_end - mem_begin;
 
-        int b_idx = cb_idx < ctx->n_bufs ? cb_idx : (cb_idx - ctx->n_bufs) % ctx->n_cache;
-        max_sizes[b_idx] = b_idx == cb_idx ? size : MAX(max_sizes[b_idx], size);
+        int b_idx = cb_idx >= ctx->n_cb - (ctx->n_bufs - ctx->n_cache) ? cb_idx - (ctx->n_cb - (ctx->n_bufs - ctx->n_cache)) + ctx->n_cache : cb_idx % ctx->n_cache;
+        max_sizes[b_idx] = MAX(max_sizes[b_idx], size);
 
+        //printf("[DEBUG] cb_idx = %d, begin = %zu, size = %zu\n", cb_idx, mem_begin, size);
         ctx->mem_begins[cb_idx] = mem_begin;
         ctx->mem_sizes[cb_idx] = size;
     }
@@ -296,7 +300,9 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
     NSDate *methodStart = [NSDate date];
 
     for (int b_idx = 0; b_idx < ctx->n_bufs; ++b_idx) {
-        GGML_ASSERT(ctx->mem_sizes[b_idx] <= max_sizes[b_idx]);
+        int cb_idx = b_idx < ctx->n_cache ? b_idx : ctx->n_cb - ctx->n_bufs + b_idx;
+        GGML_ASSERT(ctx->mem_sizes[cb_idx] <= max_sizes[b_idx]);
+
         ctx->f_bufs[b_idx] = malloc(sizeof(int8_t) * max_sizes[b_idx]);
     
         ctx->buffers[b_idx].name = name;
@@ -310,11 +316,11 @@ bool ggml_metal_add_buffer_per_layer(struct ggml_metal_context* ctx,
             return false;
         }
         GGML_METAL_LOG_INFO("%s: allocated: buf_idx = %d, size = %8.2lf MB\n", __func__, b_idx, max_sizes[b_idx] / 1024.0 / 1024.0);
-
+        
         NSTimeInterval read_begin = [[NSDate date] timeIntervalSinceDate:methodStart];
-        off_t result = lseek(fileDescriptor, ctx->mem_begins[b_idx], SEEK_SET);
+        off_t result = lseek(fileDescriptor, ctx->mem_begins[cb_idx], SEEK_SET);
         GGML_ASSERT(result >= 0);
-        ssize_t bytesRead = read(fileDescriptor, ctx->buffers[b_idx].metal.contents, ctx->mem_sizes[b_idx]);
+        ssize_t bytesRead = read(fileDescriptor, ctx->buffers[b_idx].metal.contents, ctx->mem_sizes[cb_idx]);
         NSTimeInterval read_end = [[NSDate date] timeIntervalSinceDate:methodStart];
     }
 
@@ -355,8 +361,8 @@ struct ggml_metal_context * ggml_metal_init(int n_cb) {
     // Configure context
     struct ggml_metal_context * ctx = malloc(sizeof(struct ggml_metal_context));
     ctx->device = device;
-    ctx->n_cb   = MIN(n_cb, GGML_METAL_MAX_BUFFERS);
-    ctx->queue  = [ctx->device newCommandQueue];
+    ctx->n_cb   = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
+    ctx->queue  = [ctx->device newCommandQueueWithMaxCommandBufferCount: GGML_METAL_MAX_COMMAND_BUFFERS];
     ctx->n_buffers = 0;
     ctx->concur_list_len = 0;
 
@@ -758,11 +764,11 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, stru
     }
 
 #ifdef GGML_METAL_ASYNC_MODE
-    int idx = cb_idx < ctx->n_bufs ? cb_idx : (cb_idx - ctx->n_bufs) % ctx->n_cache; //ctx->c2b[cb_idx];
-    int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[idx].data - (int64_t) ctx->mem_begins[cb_idx];
+    int b_idx = cb_idx >= ctx->n_cb - (ctx->n_bufs - ctx->n_cache) ? cb_idx - (ctx->n_cb - (ctx->n_bufs - ctx->n_cache)) + ctx->n_cache : cb_idx % ctx->n_cache;
+    int64_t ioffs = (int64_t) t->data - (int64_t) ctx->buffers[b_idx].data - (int64_t) ctx->mem_begins[cb_idx];
     if (ioffs >= 0 && ioffs + tsize <= (int64_t) ctx->mem_sizes[cb_idx]) {
         *offs = (size_t) ioffs;
-        return ctx->buffers[idx].metal;
+        return ctx->buffers[b_idx].metal;
     }
     int begin = ctx->n_bufs;
 #else
@@ -783,7 +789,7 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_metal_context * ctx, stru
         }
     }
 
-    GGML_METAL_LOG_ERROR("%s: error: buffer is nil\n", __func__);
+    GGML_METAL_LOG_ERROR("%s: error: buffer is nil, cb_idx = %d\n", __func__, cb_idx);
 
     return nil;
 }
@@ -1089,7 +1095,7 @@ void ggml_metal_graph_compute(
         // then, we encode the graph into the command buffers in parallel
 
         const int step = ctx->step;
-        const int n_cb = ctx->n_bufs; //ctx->n_cb;
+        const int n_cb = ctx->n_cb;
 
         NSDate *methodStart = [NSDate date];
 
@@ -1099,25 +1105,34 @@ void ggml_metal_graph_compute(
             // enqueue the command buffers in order to specify their execution order
             [ctx->command_buffers[i] enqueue];
 
-        // #ifdef GGML_METAL_ASYNC_MODE
-        //     [ctx->command_buffers[i] addScheduledHandler:^(id<MTLCommandBuffer> commandBuffer) {
-        //         CFTimeInterval start = commandBuffer.kernelStartTime;
-        //         CFTimeInterval end = commandBuffer.kernelEndTime;
-        //         CFTimeInterval scheduleDuration = end - start;
-        //         if (scheduleDuration > 0.01) {
-        //             printf("[DEBUG] computing %d begins: %8.2lf\n", i, scheduleDuration);
-        //         }
-        //     }];
+        #ifdef GGML_METAL_ASYNC_MODE
+            [ctx->command_buffers[i] addScheduledHandler:^(id<MTLCommandBuffer> commandBuffer) {
+                CFTimeInterval start = commandBuffer.kernelStartTime;
+                CFTimeInterval end = commandBuffer.kernelEndTime;
+                CFTimeInterval scheduleDuration = end - start;
+                // if (scheduleDuration > 0.01) {
+                //     printf("[DEBUG] computing %d begins: %8.2lf\n", i, scheduleDuration);
+                // }
+            }];
 
-        //     [ctx->command_buffers[i] addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
-        //         CFTimeInterval start = commandBuffer.GPUStartTime;
-        //         CFTimeInterval end = commandBuffer.GPUEndTime;
-        //         CFTimeInterval gpuRuntimeDuration = end - start;
-        //         if (gpuRuntimeDuration > 0.1) {
-        //             printf("[DEBUG] computing %d ends: %8.2lfs\n", i, gpuRuntimeDuration);
-        //         }
-        //     }];
-        // #endif
+            [ctx->command_buffers[i] addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+                CFTimeInterval start = commandBuffer.GPUStartTime;
+                CFTimeInterval end = commandBuffer.GPUEndTime;
+                CFTimeInterval gpuRuntimeDuration = end - start;
+                if (i == 0) {
+                    ctx->gpu_time = 0;
+                } else if (i < ctx->n_cb - 1) {
+                    ctx->gpu_time += gpuRuntimeDuration;
+                } else {
+                    ctx->gpu_time /= ctx->n_cb - 2;
+                    GGML_METAL_LOG_INFO("[DEBUG] gpu_time = %10.4lf seconds\n", ctx->gpu_time);
+                }
+
+                // if (gpuRuntimeDuration > 0.04) {
+                //     printf("[DEBUG] computing %d ends: %8.2lfs\n", i, gpuRuntimeDuration);
+                // }
+            }];
+        #endif
              ctx->command_encoders[i] = [ctx->command_buffers[i] computeCommandEncoderWithDescriptor: edesc];
         }
 
@@ -1174,17 +1189,18 @@ void ggml_metal_graph_compute(
 
         int fileDescriptor = open(ctx->path, O_RDONLY);
 
-        NSTimeInterval read_ends[65];
+        NSTimeInterval read_ends[GGML_METAL_MAX_COMMAND_BUFFERS];
         read_ends[0] = [[NSDate date] timeIntervalSinceDate:methodStart];
         //  NSTimeInterval copy_ends[65];
         //  copy_ends[0] = [[NSDate date] timeIntervalSinceDate:methodStart];
 
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-            int b_idx = (cb_idx - ctx->n_bufs) % ctx->n_cache;
+            int b_idx = cb_idx >= ctx->n_cb - (ctx->n_bufs - ctx->n_cache) ? cb_idx - (ctx->n_cb - (ctx->n_bufs - ctx->n_cache)) + ctx->n_cache : cb_idx % ctx->n_cache;
 
-            if (cb_idx >= ctx->n_bufs) {
-                int last = cb_idx - ctx->n_bufs < ctx->n_cache ? cb_idx - ctx->n_bufs : cb_idx - ctx->n_cache;
-                [ctx->command_buffers[last] waitUntilCompleted];
+            if (b_idx < ctx->n_cache && cb_idx >= ctx->n_cache) {
+                //if (cb_idx >= ctx->n_cache) {
+                    [ctx->command_buffers[cb_idx - ctx->n_cache] waitUntilCompleted];
+                //}
                 
                 NSTimeInterval read_begin = [[NSDate date] timeIntervalSinceDate:methodStart];
                 size_t offset = ctx->mem_begins[cb_idx];
@@ -1197,7 +1213,9 @@ void ggml_metal_graph_compute(
                 
                 NSTimeInterval read_end = [[NSDate date] timeIntervalSinceDate:methodStart];
                 read_ends[cb_idx+1] = read_end;
-                //printf("[DEBUG] cb_idx = %d, b_idx = %d, last = %d, wait_time = %0.2lf, read_time = %0.2lf\n", cb_idx, b_idx, last, read_begin - read_ends[cb_idx], read_end - read_begin);
+                if (read_begin - read_ends[cb_idx] > 0.01) { 
+                    //printf("[DEBUG] cb_idx = %d, b_idx = %d, wait_time = %0.2lf, read_time = %0.2lf\n", cb_idx, b_idx, read_begin - read_ends[cb_idx], read_end - read_begin);
+                }
             } else {
                 read_ends[cb_idx+1] = read_ends[cb_idx];
             }
@@ -1225,7 +1243,7 @@ void ggml_metal_graph_compute(
             size_t offs_dst  = 0;
 
             const int layer_begin = cb_idx*step;
-            const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer);
+            const int layer_end = MIN((cb_idx+1)*step, ctx->n_layer + 2);
 
             const int node_start = gf->segs[layer_begin];
             const int node_end = gf->segs[layer_end];
@@ -1703,7 +1721,7 @@ void ggml_metal_graph_compute(
 
                             // find the break-even point where the matrix-matrix kernel becomes more efficient compared
                             // to the matrix-vector kernel
-                            int ne11_mm_min = 1;
+                            int ne11_mm_min = 2;
 
 #if 0
                             // the numbers below are measured on M2 Ultra for 7B and 13B models
@@ -1953,7 +1971,7 @@ void ggml_metal_graph_compute(
 
                             // find the break-even point where the matrix-matrix kernel becomes more efficient compared
                             // to the matrix-vector kernel
-                            int ne11_mm_min = 1;
+                            int ne11_mm_min = 2; //1;
 
                             const int idx = ((int32_t *) dst->op_params)[0];
 
@@ -2590,6 +2608,22 @@ void ggml_metal_graph_compute(
         });
         }
 
+        for (int cb_idx = ctx->n_cb - ctx->n_bufs; cb_idx < ctx->n_cb - ctx->n_bufs + ctx->n_cache; ++cb_idx) {
+            [ctx->command_buffers[cb_idx] waitUntilCompleted];
+            int b_idx = cb_idx % ctx->n_cache;
+            size_t offset = ctx->mem_begins[b_idx];
+            size_t size = ctx->mem_sizes[b_idx];
+            off_t result = lseek(fileDescriptor, offset, SEEK_SET);
+            const size_t bs = 4096 * 1024;
+            for (int i = 0; i < size; i += bs) {
+                ssize_t bytesRead = read(fileDescriptor, ctx->f_bufs[b_idx] + i, size - i < bs ? size - i : bs);
+            }
+        }
+
+        close(fileDescriptor);
+
+        NSTimeInterval read_end= [[NSDate date] timeIntervalSinceDate:methodStart];
+
         // wait for all threads to finish
         dispatch_barrier_sync(ctx->d_queue, ^{});
 
@@ -2606,6 +2640,9 @@ void ggml_metal_graph_compute(
                 GGML_ASSERT(false);
             }
         }
+
+        NSTimeInterval compute_end= [[NSDate date] timeIntervalSinceDate:methodStart];
+        //printf("[DEBUG] last compute = %0.2lf\n", compute_end - read_end);
     }
 }
 
