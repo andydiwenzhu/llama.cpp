@@ -4,19 +4,35 @@ import time
 
 import pandas as pd
 
+max_context = 480
+
 model_paths = {
     "70b": "../ordered-llama-2-70b-chat-hf-q4_0.gguf",
-    "13b": "../ordered-llama-2-13b-chat-hf-fp16.gguf"
+    "13b": "../ordered-llama-2-13b-chat-hf-fp16.gguf",
 }
 
+model_offloads = {
+    "70b": [8, 16],
+    "13b": [4, 8, 6, 12],
+}
+
+chunk_sizes = {
+    "70b": 48,
+    "13b": 30,
+}
+
+model_decode = {
+    "70b": 2,
+    "13b": 8,
+}
 
 def run_exp1(model, prefix, chunk):
     prompt_len = prefix + chunk
     prompt = " ".join(["good"] * (prompt_len-1))
     if prefix == 0:
-        command = ' '.join(['make -j && ./main', '-m', model, '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', '17'])
+        command = ' '.join(['make -j && ./main', '-m', model_paths[model], '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', str(model_offloads[model][1]+1)])
     else:
-        command = ' '.join(['make -j && ./main', '-m', model, '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', '17', '-b', str(prefix)])
+        command = ' '.join(['make -j && ./main', '-m', model_paths[model], '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', str(model_offloads[model][1]+1), '-b', str(prefix)])
     print(command)
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
@@ -32,7 +48,7 @@ def eval_exp1(model):
     for c in range(1, 129):
         for p in range(1): #int(127 / c) + 1):
             for j in range(2):
-                x = run_exp1(model_paths[model], c * p, c)
+                x = run_exp1(model, c * p, c)
                 res.append({
                     "model": model,
                     "prefix/chunk": p, 
@@ -48,13 +64,13 @@ def eval_exp1(model):
                 r.to_csv(f"../results/exp1_{model}.csv", index=False)
 
 
-def run_exp2(model, prefix, chunk, layer):
+def run_exp2(model, prefix, chunk, mem):
     prompt_len = prefix + chunk
     prompt = " ".join(["good"] * (prompt_len-1))
     if prefix == 0:
-        command = ' '.join(['make -j && ./main', '-m', model, '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', str(layer)])
+        command = ' '.join(['make -j && ./main', '-m', model_paths[model], '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', str(model_offloads[model][mem]+1)])
     else:
-        command = ' '.join(['make -j && ./main', '-m', model, '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', str(layer), '-b', str(chunk)])
+        command = ' '.join(['make -j && ./main', '-m', model_paths[model], '-p', f'"{prompt}"', '-n', '1', '-e', '--threads', str(model_offloads[model][mem]+1), '-b', str(chunk)])
     print(command)
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
@@ -65,12 +81,12 @@ def run_exp2(model, prefix, chunk, layer):
     x = float(r.strip())
     return x / 1000.0
 
-def eval_exp2(model, mem=16):
+def eval_exp2(model, mem=1):
     res = []
-    for c in [44, 46, 48]:
-        for p in range(3):
-            for j in range(3):
-                x = run_exp2(model_paths[model], c * p, c, mem+1)
+    for c in [chunk_sizes[model]]:
+        for p in range(max_context // 2 // c):
+            for j in range(2):
+                x = run_exp2(model, c * p, c, mem)
                 res.append({
                     "model": model,
                     "prefix/chunk": p, 
@@ -85,32 +101,47 @@ def eval_exp2(model, mem=16):
                 time.sleep(5)
                 r = pd.DataFrame(res)
                 print(r)
-                r.to_csv(f"../results/exp2_{model}-{mem}g.csv", index=False)
+                r.to_csv(f"../results/exp2_{model}-offload-{model_offloads[model][mem]}-layer.csv", index=False)
 
 
 
-def eval_exp3(model):
+def eval_exp3(model, stage="prefill"):
+    c = chunk_sizes[model]
+    if stage == "prefill":
+        windows = [int(c * (i/4)) for i in range(1,9)]
+    else:
+        assert(stage == "decode")
+        windows = [model_decode[model]]
     res = []
-    for c in [2]:
-        for p in range(1, 8):
+    for w in windows:
+        for p in range(int(stage == "decode"), max_context // max(w, c) + int(stage == "decode")):
             for j in range(2):
-                x = run_exp1(model_paths[model], 64 * p, c)
+                x = run_exp1(model, c * p, w)
                 res.append({
                     "model": model,
-                    "chunk": c,
-                    "prefix": 64 * p,
-                    "total_ctx": 64 * p + c,
+                    "chunk": w,
+                    "prefix": c * p,
+                    "total_ctx": c * p + w,
                     "layer_time": x,
-                    "total_time": x * 16,
+                    "8g_total_time": x * model_offloads[model][0],
+                    "16g_total_time": x * model_offloads[model][1],
                     "round": j,
                 })
                 time.sleep(5)
                 r = pd.DataFrame(res)
                 print(r)
-                r.to_csv(f"../results/exp3_{model}-w2.csv", index=False)
+                r.to_csv(f"../results/exp3_{model}-{stage}-offload-{model_offloads[model][1]}-layer.csv", index=False)
 
 
 if __name__ == '__main__':
-    eval_exp1("70b")
-    #eval_exp2("70b", 8)
-    #eval_exp3("70b")
+    #eval_exp1("70b")
+    #eval_exp2("70b", 0)
+    #eval_exp2("70b", 1)
+    #eval_exp3("70b", "prefill")
+    #eval_exp3("70b", "decode")
+    #eval_exp2("13b", 0)
+    #eval_exp2("13b", 1)
+    #eval_exp2("13b", 2)
+    #eval_exp2("13b", 3)
+    #eval_exp3("13b", "prefill")
+    eval_exp3("13b", "decode")
